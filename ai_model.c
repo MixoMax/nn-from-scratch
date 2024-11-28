@@ -10,105 +10,31 @@ ai_model.c
 A very simple implementation of a neural network with Linear layers.
 */
 
-/*
-Python code:
-import random
-import json
-import time
 
-class NeuralNetwork:
-    def __init__(self, input_size: int = 784, hidden_layers = [512, 512], output_size: int = 10):
-        self.input_size = input_size
-        self.hidden_layers = hidden_layers
-        self.output_size = output_size
-        self.weights = []
-        self.biases = []
-
-        # Input to hidden Layers Network
-        
-        # self.weights.append(0.01 * np.random.randn(input_size, hidden_layers[0]))
-        self.weights.append([[0.01 * random.gauss(0, 1) for _ in range(hidden_layers[0])] for _ in range(input_size)])
+// Determine SIMD size based on supported instruction set
+#if defined(__AVX512F__)
+    #define SIMD_SIZE 8
+#elif defined(__AVX__)
+    #define SIMD_SIZE 4
+#elif defined(__SSE2__)
+    #define SIMD_SIZE 2
+#else
+    #define SIMD_SIZE 1 // Fallback if no SIMD support
+#endif
 
 
-        # self.biases.append(np.zeros(output_size))
-        self.biases.append([0 for _ in range(output_size)])
-
-    
-    def forward(self, inputs: list[float]):
-        layers = [inputs]
-
-        for i in range(len(self.weights)):
-            # Dot product
-
-            # layers.append(np.dot(layers[-1], self.weights[i]) + self.biases[i])
-            layers.append([sum(layers[-1][j] * self.weights[i][j][k] for j in range(len(layers[-1]))) + self.biases[i][k] for k in range(len(self.biases[i]))])
-        
-        return layers[-1]
-
-    def _from_pyt_state_dict(self, json_path: str):
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        
-        self.weights = []
-        self.biases = []
-
-        # we need to rotate the weights
-        # a pytorch layedr Linear(a,b) has len(data[key]) = b and len(data[key][0]) = a
-        # but in our case, we need to have len(data[key]) = a and len(data[key][0]) = b
-        
-        # json is like this: {"model.0.weight": [[], [], ...], "model.0.bias": [], "model.1.weight": [], "model.1.bias": [], ...}
-        for key in data:
-            if 'weight' in key:
-                d = data[key]
-                # rotate the matrix
-                # d = np.array(d).T.tolist()
-                d = list(map(list, zip(*d)))
-                self.weights.append(d)
-            elif 'bias' in key:
-                d = data[key]
-                self.biases.append(d)
-            else:
-                raise ValueError('Invalid key')
-        
-        # reset the input size, hidden layers, and output size to the ones in the model
-        self.input_size = len(self.weights[0])
-        self.hidden_layers = [len(self.weights[i]) for i in range(1, len(self.weights)-1)]
-        self.output_size = len(self.weights[-1][0])
-        
-        
-        return self
-    
-    def __str__(self):
-        return f'NeuralNetwork(input_size={self.input_size}, hidden_layers={self.hidden_layers}, output_size={self.output_size})'
-    
-    def summary(self):
-        n_total_params = 0
-        for i in range(len(self.weights)):
-            n_total_params += len(self.weights[i]) + len(self.biases[i])
-        
-        print(f'Neural Network Summary\n{"-"*20}\n')
-        print(f'Input Size: {self.input_size}')
-        print("Layer Shapes:")
-        for i in range(len(self.weights)):
-            print(f'Layer {i+1}: {len(self.weights[i])}x{len(self.weights[i][0])}')
-        print(f'Output Size: {self.output_size}')
-
-model = NeuralNetwork()._from_pyt_state_dict('./model.json')
-print(model)
-model.summary()
-
-sample_X = [random.random() for _ in range(784)]
-t_start = time.time()
-print(model.forward(sample_X))
-print(f'Time: {time.time() - t_start}')
-*/
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+
+// Include jansson for JSON parsing
 #include <jansson.h>
+
+// For SIMD optimization
+#include <immintrin.h>
 
 // Dynamic 2D array structure
 typedef struct {
@@ -202,6 +128,56 @@ void free_neural_network(NeuralNetwork* nn) {
     free(nn->biases);
 }
 
+Matrix matrix_multiply_with_bias(Matrix a, Matrix b, Matrix bias) {
+    Matrix result = create_matrix(a.rows, b.cols);
+    for (int r = 0; r < a.rows; r++) {
+        for (int c = 0; c < b.cols; c++) {
+            double val = 0.0;
+            for (int k = 0; k < a.cols; k++) {
+                val += a.data[r][k] * b.data[k][c];
+            }
+            result.data[r][c] = val + bias.data[0][c];
+        }
+    }
+    return result;
+}
+
+Matrix matrix_multiply_with_bias_simd(Matrix a, Matrix b, Matrix bias) {
+    Matrix result = create_matrix(a.rows, b.cols);
+    int simd_size = 4;
+    
+    // Process blocks of 4 columns using SIMD
+    for (int i = 0; i < a.rows; i++) {
+        int j;
+        // Handle SIMD-aligned portion
+        for (j = 0; j <= b.cols - simd_size; j += simd_size) {
+            __m256d sum = _mm256_setzero_pd();
+            for (int k = 0; k < a.cols; k++) {
+                __m256d a_val = _mm256_set1_pd(a.data[i][k]);
+                __m256d b_val = _mm256_loadu_pd(&b.data[k][j]);
+                sum = _mm256_fmadd_pd(a_val, b_val, sum);
+            }
+            __m256d bias_val = _mm256_loadu_pd(&bias.data[0][j]);
+            sum = _mm256_add_pd(sum, bias_val);
+            _mm256_storeu_pd(&result.data[i][j], sum);
+        }
+        
+        // Handle remaining columns scalar way
+        for (; j < b.cols; j++) {
+            double sum = 0.0;
+            for (int k = 0; k < a.cols; k++) {
+                sum += a.data[i][k] * b.data[k][j];
+            }
+            result.data[i][j] = sum + bias.data[0][j];
+        }
+    }
+    
+    return result;
+}
+
+
+
+
 // Forward Pass
 Matrix forward_pass(NeuralNetwork* nn, Matrix inputs) {
     Matrix layers[nn->hidden_layer_count + 2];
@@ -214,15 +190,7 @@ Matrix forward_pass(NeuralNetwork* nn, Matrix inputs) {
         layers[i+1] = create_matrix(out_rows, out_cols);
 
         // Compute matrix multiplication with bias
-        for (int r = 0; r < out_rows; r++) {
-            for (int c = 0; c < out_cols; c++) {
-                double val = 0.0;
-                for (int k = 0; k < layers[i].cols; k++) {
-                    val += layers[i].data[r][k] * nn->weights[i].data[k][c];
-                }
-                layers[i+1].data[r][c] = val + nn->biases[i].data[0][c];
-            }
-        }
+        layers[i+1] = matrix_multiply_with_bias_simd(layers[i], nn->weights[i], nn->biases[i]);
     }
 
     return layers[nn->hidden_layer_count + 1];
@@ -386,6 +354,21 @@ int main() {
     // Seed random number generator
     srand(time(NULL));
 
+    switch (SIMD_SIZE) {
+        case 8:
+            printf("Using AVX-512 SIMD\n");
+            break;
+        case 4:
+            printf("Using AVX SIMD\n");
+            break;
+        case 2:
+            printf("Using SSE2 SIMD\n");
+            break;
+        default:
+            printf("No SIMD support\n");
+            break;
+    }
+
     // Load neural network from PyTorch JSON
     NeuralNetwork nn = load_from_pytorch_json("model.json");
     print_neural_network_summary(&nn);
@@ -433,7 +416,7 @@ int main() {
     double t_start = (double)clock() / CLOCKS_PER_SEC;
 
     for (size_t i = 0; i < n_samples; i++) {
-        printf("Sample %zu / %zu\n", i + 1, n_samples);
+        //printf("Sample %zu / %zu\n", i + 1, n_samples);
         json_t* sample = json_array_get(X, i);
         if (!json_is_array(sample)) {
             fprintf(stderr, "Sample must be an array\n");
