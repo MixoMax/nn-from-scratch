@@ -62,6 +62,10 @@ Matrix forward_pass(NeuralNetwork* nn, Matrix inputs);
 NeuralNetwork load_from_pytorch_json(const char* json_path);
 void print_neural_network_summary(NeuralNetwork* nn);
 
+double max(double a, double b) {
+    return a > b ? a : b;
+}
+
 // Matrix creation and manipulation
 Matrix create_matrix(int rows, int cols) {
     Matrix m;
@@ -175,6 +179,29 @@ Matrix matrix_multiply_with_bias_simd(Matrix a, Matrix b, Matrix bias) {
     return result;
 }
 
+Matrix ReLu_simd(Matrix m) {
+    Matrix result = create_matrix(m.rows, m.cols);
+    int simd_size = 4;
+    
+    for (int i = 0; i < m.rows; i++) {
+        int j;
+        // Handle SIMD-aligned portion
+        for (j = 0; j <= m.cols - simd_size; j += simd_size) {
+            __m256d zero = _mm256_setzero_pd();
+            __m256d val = _mm256_loadu_pd(&m.data[i][j]);
+            __m256d mask = _mm256_cmp_pd(val, zero, _CMP_GT_OQ);
+            _mm256_storeu_pd(&result.data[i][j], _mm256_and_pd(val, mask));
+        }
+        
+        // Handle remaining columns scalar way
+        for (; j < m.cols; j++) {
+            result.data[i][j] = max(0.0, m.data[i][j]);
+        }
+    }
+    
+    return result;
+}
+
 
 
 
@@ -190,7 +217,8 @@ Matrix forward_pass(NeuralNetwork* nn, Matrix inputs) {
         layers[i+1] = create_matrix(out_rows, out_cols);
 
         // Compute matrix multiplication with bias
-        layers[i+1] = matrix_multiply_with_bias_simd(layers[i], nn->weights[i], nn->biases[i]);
+        layers[i+1] = ReLu_simd(matrix_multiply_with_bias_simd(layers[i], nn->weights[i], nn->biases[i]));
+
     }
 
     return layers[nn->hidden_layer_count + 1];

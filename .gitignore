@@ -2,3 +2,5 @@
 /mnist_data
 *.pth
 *.json
+*.exe
+*.pkl
